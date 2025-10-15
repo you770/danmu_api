@@ -43,4 +43,4 @@ jobs:
 
           # 构建带 latest 标签的镜像并推送
           docker buildx build --platform linux/amd64,linux/arm64 -t ${{ secrets.DOCKER_USERNAME }}/danmu-api:latest --push .
-on: none
+
