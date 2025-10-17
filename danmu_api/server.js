@@ -77,8 +77,27 @@ function createServer() {
       // 构造完整的请求 URL
       const fullUrl = `http://${req.headers.host}${req.url}`;
 
-      // 获取请求客户端的ip
-      const clientIp = req.connection.remoteAddress || 'unknown';
+      // 获取请求客户端的ip，兼容反向代理场景
+      let clientIp = 'unknown';
+      
+      // 优先级：X-Forwarded-For > X-Real-IP > 直接连接IP
+      const forwardedFor = req.headers['x-forwarded-for'];
+      if (forwardedFor) {
+        // X-Forwarded-For 可能包含多个IP（代理链），第一个是真实客户端IP
+        clientIp = forwardedFor.split(',')[0].trim();
+        console.log(`[server] Using X-Forwarded-For IP: ${clientIp}`);
+      } else if (req.headers['x-real-ip']) {
+        clientIp = req.headers['x-real-ip'];
+        console.log(`[server] Using X-Real-IP: ${clientIp}`);
+      } else {
+        clientIp = req.connection.remoteAddress || 'unknown';
+        console.log(`[server] Using direct connection IP: ${clientIp}`);
+      }
+      
+      // 清理IPv6前缀（如果存在）
+      if (clientIp && clientIp.startsWith('::ffff:')) {
+        clientIp = clientIp.substring(7);
+      }
 
       // 异步读取 POST/PUT 请求的请求体
       let body;

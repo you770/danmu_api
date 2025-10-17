@@ -1,6 +1,6 @@
 // 全局状态（Cloudflare 和 Vercel 都可能重用实例）
 // ⚠️ 不是持久化存储，每次冷启动会丢失
-const VERSION = "1.3.3";
+const VERSION = "1.3.4";
 let animes = [];
 let episodeIds = [];
 let episodeNum = 10001; // 全局变量，用于自增 ID
@@ -4168,14 +4168,15 @@ async function handleTencentAnimes(animesTencent, queryTitle, curAnimes) {
         links.push({
           "name": i + 1,
           "url": fullUrl,
-          "title": `【tencent】${anime.title}(${anime.year}) #${epTitle}#`
+          "title": `【tencent】 #${epTitle}#`
         });
       }
 
       if (links.length > 0) {
-        // 直接使用mediaId作为animeId和bangumiId
+        // 将字符串mediaId转换为数字ID (使用哈希函数)
+        const numericAnimeId = convertToAsciiSum(anime.mediaId);
         let transformedAnime = {
-          animeId: anime.mediaId,
+          animeId: numericAnimeId,
           bangumiId: anime.mediaId,
           animeTitle: `${anime.title}(${anime.year})【${anime.type}】from tencent`,
           type: anime.type,
