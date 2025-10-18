@@ -1,6 +1,6 @@
 // 全局状态（Cloudflare 和 Vercel 都可能重用实例）
 // ⚠️ 不是持久化存储，每次冷启动会丢失
-const VERSION = "1.3.4";
+const VERSION = "1.3.5";
 let animes = [];
 let episodeIds = [];
 let episodeNum = 10001; // 全局变量，用于自增 ID
@@ -110,7 +110,7 @@ let sourceOrderArr = [];
 function resolveSourceOrder(env, deployPlatform) {
   // 获取环境变量中的 SOURCE_ORDER 配置
   let sourceOrder = DEFAULT_SOURCE_ORDER;
-  if (deployPlatform === "cloudflare" || deployPlatform === "vercel") {
+  if (deployPlatform === "cloudflare" || deployPlatform === "vercel" || deployPlatform === "netlify") {
       sourceOrder += ",bahamut";
   }
 
@@ -349,9 +349,6 @@ function addAnime(anime) {
         return false;
     }
 
-    // 创建 anime 的副本以避免修改原始对象
-    const animeCopy = { ...anime, links: [] }; // 初始化 links 为空数组
-
     // 遍历 links，调用 addEpisode，并收集返回的对象
     const newLinks = [];
     anime.links.forEach(link => {
@@ -365,17 +362,28 @@ function addAnime(anime) {
         }
     });
 
-    // 替换 animeCopy 的 links
-    animeCopy.links = newLinks;
+    // 创建新的 anime 副本
+    const animeCopy = { ...anime, links: newLinks };
 
-    // 添加到 animes
+    // 检查是否已存在相同 animeId 的 anime
+    const existingAnimeIndex = animes.findIndex(a => a.animeId === anime.animeId);
+
+    if (existingAnimeIndex !== -1) {
+        // 如果存在，先删除旧的
+        animes.splice(existingAnimeIndex, 1);
+        log("info", `Removed old anime at index: ${existingAnimeIndex}`);
+    }
+
+    // 将新的添加到数组末尾（最新位置）
     animes.push(animeCopy);
-    log("info", `Added anime: ${JSON.stringify(animeCopy)}`);
+    log("info", `Added anime to latest position: ${anime.animeId}`);
 
     // 检查是否超过 MAX_ANIMES，超过则删除最早的
     if (animes.length > MAX_ANIMES) {
         removeEarliestAnime();
     }
+
+    console.log("animes: ", animes);
 
     return true;
 }
@@ -470,13 +478,21 @@ function getPreferAnimeId(title) {
 async function httpGet(url, options) {
   log("info", `[iOS模拟] HTTP GET: ${url}`);
 
+  // 设置超时时间（默认5秒）
+  const timeout = parseInt(process.env.VOD_REQUEST_TIMEOUT || '5000');
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+
   try {
     const response = await fetch(url, {
       method: 'GET',
       headers: {
         ...options.headers,
-      }
+      },
+      signal: controller.signal
     });
+
+    clearTimeout(timeoutId);
 
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);
@@ -559,6 +575,17 @@ async function httpGet(url, options) {
     };
 
   } catch (error) {
+    clearTimeout(timeoutId);
+
+    // 检查是否是超时错误
+    if (error.name === 'AbortError') {
+      log("error", `[iOS模拟] 请求超时:`, error.message);
+      log("error", '详细诊断:');
+      log("error", '- URL:', url);
+      log("error", '- 超时时间:', `${timeout}ms`);
+      throw new Error(`Request timeout after ${timeout}ms`);
+    }
+
     log("error", `[iOS模拟] 请求失败:`, error.message);
     log("error", '详细诊断:');
     log("error", '- URL:', url);
@@ -622,6 +649,43 @@ async function httpPost(url, body, options = {}) {
       log("error", '- 原因:', error.cause.message);
     }
     throw error;
+  }
+}
+
+async function getPageTitle(url) {
+  try {
+    // 使用 httpGet 获取网页内容
+    const response = await httpGet(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15'
+      }
+    });
+
+    // response.data 包含 HTML 内容
+    const html = response.data;
+
+    // 方法1: 使用正则表达式提取 <title> 标签
+    const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/i);
+    if (titleMatch && titleMatch[1]) {
+      // 解码 HTML 实体（如 &nbsp; &amp; 等）
+      const title = titleMatch[1]
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .trim();
+
+      return title;
+    }
+
+    // 如果没找到 title 标签
+    return url;
+
+  } catch (error) {
+    log("error", `获取标题失败: ${error.message}`);
+    return url;
   }
 }
 
@@ -1792,46 +1856,15 @@ async function getTencentEpisodes(cid) {
       }
     }
 
-    if (tabs.length === 0) {
-      log("info", "[Tencent] 未找到分页信息");
-      return [];
-    }
-
-    log("info", `[Tencent] 找到 ${tabs.length} 个分页`);
-
     // 获取所有分页的分集
     const allEpisodes = [];
-    for (const tab of tabs) {
-      if (!tab.page_context) continue;
 
-      const tabPayload = {
-        has_cache: 1,
-        page_params: {
-          req_from: "web_vsite",
-          page_id: "vsite_episode_list",
-          page_type: "detail_operation",
-          id_type: "1",
-          page_size: "",
-          cid: cid,
-          vid: "",
-          lid: "",
-          page_num: "",
-          page_context: tab.page_context,
-          detail_page_type: "1"
-        }
-      };
+    if (tabs.length === 0) {
+      log("info", "[Tencent] 未找到分页信息,尝试从初始响应中提取分集");
 
-      const tabResponse = await httpPost(episodesUrl, JSON.stringify(tabPayload), { headers });
-
-      if (!tabResponse || !tabResponse.data) continue;
-
-      const tabData = typeof tabResponse.data === "string" ? JSON.parse(tabResponse.data) : tabResponse.data;
-
-      if (tabData.ret !== 0 || !tabData.data) continue;
-
-      // 提取分集
-      if (tabData.data.module_list_datas) {
-        for (const moduleListData of tabData.data.module_list_datas) {
+      // 尝试直接从第一次响应中提取分集(单页情况)
+      if (data.data && data.data.module_list_datas) {
+        for (const moduleListData of data.data.module_list_datas) {
           for (const moduleData of moduleListData.module_datas) {
             if (moduleData.item_data_lists && moduleData.item_data_lists.item_datas) {
               for (const item of moduleData.item_data_lists.item_datas) {
@@ -1841,6 +1874,64 @@ async function getTencentEpisodes(cid) {
                     title: item.item_params.title,
                     unionTitle: item.item_params.union_title || item.item_params.title
                   });
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (allEpisodes.length === 0) {
+        log("info", "[Tencent] 初始响应中也未找到分集信息");
+        return [];
+      }
+
+      log("info", `[Tencent] 从初始响应中提取到 ${allEpisodes.length} 集`);
+    } else {
+      log("info", `[Tencent] 找到 ${tabs.length} 个分页`);
+
+      // 获取所有分页的分集
+      for (const tab of tabs) {
+        if (!tab.page_context) continue;
+
+        const tabPayload = {
+          has_cache: 1,
+          page_params: {
+            req_from: "web_vsite",
+            page_id: "vsite_episode_list",
+            page_type: "detail_operation",
+            id_type: "1",
+            page_size: "",
+            cid: cid,
+            vid: "",
+            lid: "",
+            page_num: "",
+            page_context: tab.page_context,
+            detail_page_type: "1"
+          }
+        };
+
+        const tabResponse = await httpPost(episodesUrl, JSON.stringify(tabPayload), { headers });
+
+        if (!tabResponse || !tabResponse.data) continue;
+
+        const tabData = typeof tabResponse.data === "string" ? JSON.parse(tabResponse.data) : tabResponse.data;
+
+        if (tabData.ret !== 0 || !tabData.data) continue;
+
+        // 提取分集
+        if (tabData.data.module_list_datas) {
+          for (const moduleListData of tabData.data.module_list_datas) {
+            for (const moduleData of moduleListData.module_datas) {
+              if (moduleData.item_data_lists && moduleData.item_data_lists.item_datas) {
+                for (const item of moduleData.item_data_lists.item_datas) {
+                  if (item.item_params && item.item_params.vid && item.item_params.is_trailer !== "1") {
+                    allEpisodes.push({
+                      vid: item.item_params.vid,
+                      title: item.item_params.title,
+                      unionTitle: item.item_params.union_title || item.item_params.title
+                    });
+                  }
                 }
               }
             }
@@ -2325,7 +2416,7 @@ async function fetchBilibili(inputUrl) {
       return [];
     }
 
-  // 番剧
+  // 番剧 - ep格式
   } else if (inputUrl.includes("bangumi/") && inputUrl.includes("ep")) {
     try {
       const epid = path.slice(-1)[0].slice(2);
@@ -2364,8 +2455,49 @@ async function fetchBilibili(inputUrl) {
       return [];
     }
 
+  // 番剧 - ss格式
+  } else if (inputUrl.includes("bangumi/") && inputUrl.includes("ss")) {
+    try {
+      const ssid = path.slice(-1)[0].slice(2).split('?')[0]; // 移除可能的查询参数
+      const ssInfoUrl = `${api_epid_cid}?season_id=${ssid}`;
+
+      log("info", `获取番剧信息: season_id=${ssid}`);
+
+      const res = await httpGet(ssInfoUrl, {
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        },
+      });
+
+      const data = typeof res.data === "string" ? JSON.parse(res.data) : res.data;
+      if (data.code !== 0) {
+        log("error", "获取番剧视频信息失败:", data.message);
+        return [];
+      }
+
+      // 检查是否有episodes数据
+      if (!data.result.episodes || data.result.episodes.length === 0) {
+        log("error", "番剧没有可用的集数");
+        return [];
+      }
+
+      // 默认获取第一集的弹幕
+      const firstEpisode = data.result.episodes[0];
+      title = firstEpisode.share_copy;
+      cid = firstEpisode.cid;
+      duration = firstEpisode.duration / 1000;
+      danmakuUrl = `https://comment.bilibili.com/${cid}.xml`;
+
+      log("info", `使用第一集: ${title}, cid=${cid}`);
+
+    } catch (error) {
+      log("error", "请求番剧视频信息失败:", error);
+      return [];
+    }
+
   } else {
-    log("error", "不支持的B站视频网址，仅支持普通视频(av,bv)、剧集视频(ep)");
+    log("error", "不支持的B站视频网址，仅支持普通视频(av,bv)、剧集视频(ep,ss)");
     return [];
   }
   log("info", danmakuUrl, cid, aid, duration);
@@ -3926,11 +4058,7 @@ async function handleVodAnimes(animesVod, curAnimes, key) {
       };
 
       curAnimes.push(transformedAnime);
-      const exists = animes.some(existingAnime => existingAnime.animeId.toString() === transformedAnime.animeId.toString());
-      if (!exists) {
-        const transformedAnimeCopy = {...transformedAnime, links: links};
-        addAnime(transformedAnimeCopy);
-      }
+      addAnime({...transformedAnime, links: links});
       if (animes.length > MAX_ANIMES) removeEarliestAnime();
     }
   }));
@@ -3994,11 +4122,7 @@ async function handle360Animes(animes360, curAnimes) {
       };
 
       curAnimes.push(transformedAnime);
-      const exists = animes.some(existingAnime => existingAnime.animeId.toString() === transformedAnime.animeId.toString());
-      if (!exists) {
-        const transformedAnimeCopy = {...transformedAnime, links: links};
-        addAnime(transformedAnimeCopy);
-      }
+      addAnime({...transformedAnime, links: links});
       if (animes.length > MAX_ANIMES) removeEarliestAnime();
     }
   }));
@@ -4037,11 +4161,7 @@ async function handleRenrenAnimes(animesRenren, queryTitle, curAnimes) {
 
         curAnimes.push(transformedAnime);
 
-        const exists = animes.some(existingAnime => existingAnime.animeId.toString() === transformedAnime.animeId.toString());
-        if (!exists) {
-          const transformedAnimeCopy = {...transformedAnime, links: links};
-          addAnime(transformedAnimeCopy);
-        }
+        addAnime({...transformedAnime, links: links});
 
         if (animes.length > MAX_ANIMES) removeEarliestAnime();
       }
@@ -4090,11 +4210,7 @@ async function handleHanjutvAnimes(animesHanjutv, queryTitle, curAnimes) {
 
         curAnimes.push(transformedAnime);
 
-        const exists = animes.some(existingAnime => existingAnime.animeId.toString() === transformedAnime.animeId.toString());
-        if (!exists) {
-          const transformedAnimeCopy = {...transformedAnime, links: links};
-          addAnime(transformedAnimeCopy);
-        }
+        addAnime({...transformedAnime, links: links});
 
         if (animes.length > MAX_ANIMES) removeEarliestAnime();
       }
@@ -4138,11 +4254,7 @@ async function handleBahamutAnimes(animesBahamut, queryTitle, curAnimes) {
 
         curAnimes.push(transformedAnime);
 
-        const exists = animes.some(existingAnime => existingAnime.animeId.toString() === transformedAnime.animeId.toString());
-        if (!exists) {
-          const transformedAnimeCopy = {...transformedAnime, links: links};
-          addAnime(transformedAnimeCopy);
-        }
+        addAnime({...transformedAnime, links: links});
 
         if (animes.length > MAX_ANIMES) removeEarliestAnime();
       }
@@ -4190,11 +4302,7 @@ async function handleTencentAnimes(animesTencent, queryTitle, curAnimes) {
 
         curAnimes.push(transformedAnime);
 
-        const exists = animes.some(existingAnime => existingAnime.animeId.toString() === transformedAnime.animeId.toString());
-        if (!exists) {
-          const transformedAnimeCopy = {...transformedAnime, links: links};
-          addAnime(transformedAnimeCopy);
-        }
+        addAnime({...transformedAnime, links: links});
 
         if (animes.length > MAX_ANIMES) removeEarliestAnime();
       }
@@ -4227,7 +4335,7 @@ async function searchAnime(url) {
       "isFavorited": true
     };
 
-    let platform = "all";
+    let platform = "unknown";
     if (queryTitle.includes(".qq.com")) {
       platform = "qq";
     } else if (queryTitle.includes(".iqiyi.com")) {
@@ -4240,18 +4348,21 @@ async function searchAnime(url) {
       platform = "bilibili1";
     }
 
+    const pageTitle = await getPageTitle(queryTitle);
+
     const links = [{
       "name": "手动解析链接弹幕",
       "url": queryTitle,
-      "title": `【${platform}】 #${queryTitle}#`
+      "title": `【${platform}】 #${pageTitle}#`
     }];
     curAnimes.push(tmpAnime);
-    const exists = animes.some(existingAnime => existingAnime.animeId === tmpAnime.animeId);
-    if (!exists) {
-      const transformedAnimeCopy = {...tmpAnime, links: links};
-      addAnime(transformedAnimeCopy);
-    }
+    addAnime({...tmpAnime, links: links});
     if (animes.length > MAX_ANIMES) removeEarliestAnime();
+
+    // 如果有新的anime获取到，则更新redis
+    if (redisValid && curAnimes.length !== 0) {
+      await updateCaches();
+    }
 
     return jsonResponse({
       errorCode: 0,
@@ -5104,6 +5215,39 @@ export async function vercelHandler(req, res) {
   response.headers.forEach((value, key) => res.setHeader(key, value));
   const text = await response.text();
   res.send(text);
+}
+
+// --- Netlify 入口 ---
+export async function netlifyHandler(event, context) {
+  // 获取客户端 IP
+  const clientIp = event.headers['x-nf-client-connection-ip'] ||
+                   event.headers['x-forwarded-for'] ||
+                   context.ip ||
+                   'unknown';
+
+  // 构造标准 Request 对象
+  const url = event.rawUrl || `https://${event.headers.host}${event.path}`;
+
+  const request = new Request(url, {
+    method: event.httpMethod,
+    headers: new Headers(event.headers),
+    body: event.body ? event.body : undefined,
+  });
+
+  // 调用核心处理函数
+  const response = await handleRequest(request, process.env, "netlify", clientIp);
+
+  // 转换为 Netlify 响应格式
+  const headers = {};
+  response.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+
+  return {
+    statusCode: response.status,
+    headers,
+    body: await response.text(),
+  };
 }
 
 // 为了测试导出 handleRequest
